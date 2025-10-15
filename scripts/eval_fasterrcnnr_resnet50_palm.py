@@ -24,7 +24,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 import yaml
 import matplotlib.pyplot as plt
 
-from torchvision.models.detection import ssdlite320_mobilenet_v3_large
 from pycocotools.coco import COCO
 
 # bootstrap sys.path

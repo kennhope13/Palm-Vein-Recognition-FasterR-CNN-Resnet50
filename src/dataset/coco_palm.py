@@ -6,33 +6,19 @@ import albumentations as A
 from albumentations.pytorch.transforms import ToTensorV2
 
 
-# ======= FASTER R-CNN (TỰ RESIZE BÊN TRONG MODEL) =======
-
 def get_transforms_faster(train: bool):
-    """
-    Dùng cho Faster R-CNN (torchvision) — KHÔNG Resize ở đây.
-    Model sẽ tự resize về min_size/max_size (mặc định 800/1333).
-    """
     aug = []
     if train:
         aug += [
             A.HorizontalFlip(p=0.5),
             A.ColorJitter(0.3, 0.3, 0.3, 0.3, p=0.5),
         ]
-    # Không Normalize cũng được vì torchvision đã chuẩn hoá nội bộ.
-    # Nếu muốn vẫn có thể Normalize ImageNet ở đây; thường không cần.
     aug += [ToTensorV2()]
-
     return A.Compose(
         aug,
         bbox_params=A.BboxParams(format="pascal_voc", label_fields=["cls"])
     )
-
 def get_transforms_resnet50_faster(train: bool):
-    """
-    Alias cho Faster R-CNN ResNet50-FPN (giống hệt get_transforms_faster).
-    Đặt tên rõ để bạn gọi đúng theo backbone nếu thích.
-    """
     return get_transforms_faster(train)
 
 

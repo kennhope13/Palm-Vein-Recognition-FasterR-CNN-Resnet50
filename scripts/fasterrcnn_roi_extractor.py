@@ -14,7 +14,7 @@ from albumentations.pytorch.transforms import ToTensorV2
 
 # import your build_model function from training script location
 # adjust import path if needed
-from scripts.train_fasterrcnnr_resnet50_palm import build_model  # or from your module
+from scripts.train_fasterrcnn_resnet50_palm import build_model  # or from your module
 # if that import path doesn't work, copy build_model into this file
 
 warnings.filterwarnings("ignore", category=UserWarning)

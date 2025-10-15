@@ -26,6 +26,6 @@ best_select: "map"
 conf_eval: 0.30
 
 # Save
-save_dir: "output"
+save_dir: "output_fasterrcnn_efficientnetb0_palm"
 save_pred_map: true
 save_pred_map_split: "valid"   # valid|test

@@ -1,12 +1,3 @@
-# -*- coding: utf-8 -*-
-# Faster R-CNN ResNet50-FPN (1 class: palm)
-# Bản sửa: lưu theo thư mục con (checkpoints, plots, logs, diagnostics)
-# - logs/metrics_epoch.json
-# - logs/metrics_summary.json
-# - checkpoints/{best_map.pth,best_loss.pth,best_model.pth}
-# - plots/{loss_curve.png,metrics_curve.png}
-# - diagnostics/{train_diagnostics.json, valid_diagnostics.json}
-
 import sys, pathlib, yaml, warnings, shutil, torch, json, matplotlib.pyplot as plt, os, collections, random
 warnings.filterwarnings("ignore", category=UserWarning)
 from pathlib import Path
@@ -16,6 +7,43 @@ import albumentations as A
 from albumentations.pytorch.transforms import ToTensorV2
 import torchvision
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.feature_extraction import create_feature_extractor
+# robust import: FeaturePyramidNetwork exists in torchvision.ops in most versions;
+# LastLevelMaxPool may not exist on older torchvision installations — provide fallback.
+from collections import OrderedDict
+try:
+    from torchvision.ops import FeaturePyramidNetwork, LastLevelMaxPool  # type: ignore
+except Exception:
+    # FeaturePyramidNetwork should exist; if it doesn't, let the import error propagate.
+    from torchvision.ops import FeaturePyramidNetwork  # type: ignore
+
+    import torch.nn as nn
+    import torch
+
+    class LastLevelMaxPool(nn.Module):
+        """
+        Minimal compatible replacement for torchvision.ops.LastLevelMaxPool.
+        It takes an OrderedDict of feature maps (from FPN) and appends one extra level
+        by applying 2x2 max pool on the last/top feature map (same behavior as torchvision).
+        """
+        def __init__(self):
+            super().__init__()
+
+        def forward(self, x):
+            # x: OrderedDict[str, Tensor]
+            if not isinstance(x, dict):
+                # try to handle unexpected input
+                return x
+            # get last item (top-most feature)
+            *_, (last_k, last_feat) = (*x.items(),)
+            # apply max pool with kernel_size=1? torchvision LastLevelMaxPool uses nn.MaxPool2d(1, stride=2)
+            # Actually torchvision's LastLevelMaxPool: return last_feat and last_feat_pool
+            pooled = nn.functional.max_pool2d(last_feat, kernel_size=1, stride=2, padding=0)
+            # name the new level with something unique (e.g. last_k + "_pool")
+            out = x.copy()
+            out_name = last_k + "_pool"
+            out[out_name] = pooled
+            return out
 
 # project
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -45,18 +73,117 @@ def load_cfg(path="configs/fasterrcnn_resnet50_palm.yaml"):
             cfg[k] = cfg[k].replace("${root_path}", root)
     return cfg
 
-def build_model(num_classes: int, min_size=None, max_size=None, trainable_backbone_layers=3, freeze_backbone=False):
-    weights = torchvision.models.detection.FasterRCNN_ResNet50_FPN_Weights.DEFAULT
-    kwargs = {"weights": weights, "trainable_backbone_layers": trainable_backbone_layers}
-    if min_size is not None: kwargs["min_size"] = int(min_size)
-    if max_size is not None: kwargs["max_size"] = int(max_size)
-    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(**kwargs)
+def _list_named_modules(model):
+    for name, m in model.named_modules():
+        print(name, m.__class__.__name__)
+
+def build_model_efficientnet_b0(num_classes: int,
+                               fpn_out_channels: int = 256,
+                               pretrained_backbone: bool = True,
+                               trainable_backbone_layers: int = 3,
+                               min_size=None, max_size=None,
+                               return_layers=None,
+                               freeze_backbone=False):
+    """
+    Build Faster R-CNN with EfficientNet-B0 backbone + FPN.
+    - num_classes: including background (bg=0)
+    - fpn_out_channels: number of channels output by FPN (typical 256)
+    - pretrained_backbone: if True, load ImageNet weights for EfficientNet
+    - trainable_backbone_layers: number of last blocks to keep trainable (like torchvision API)
+    - return_layers: dict mapping from EfficientNet node names -> new names, e.g. {'features.2': 'feat0', ...}
+                     If None, function will try a default mapping for torchvision's efficientnet_b0.
+    - freeze_backbone: if True, freeze whole backbone body parameters (after possible trimming)
+    """
+    # --- 1) load efficientnet_b0 from torchvision ---
+    try:
+        # torchvision >= 0.13 style
+        eff = torchvision.models.efficientnet_b0(weights="IMAGENET1K_V1" if pretrained_backbone else None)
+    except Exception:
+        # fallback older API
+        eff = torchvision.models.efficientnet_b0(pretrained=pretrained_backbone)
+
+    eff.eval()
+
+    # --- 2) choose return layers (intermediate nodes) ---
+    # Default mapping that usually works for torchvision efficientnet_b0 implementation.
+    # If this mapping errors for your torchvision version, call _list_named_modules(eff) to inspect names and customize.
+    if return_layers is None:
+        # These nodes commonly exist: 'features.2', 'features.4', 'features.6', 'features.8'
+        # They provide progressively lower->higher resolution feature maps.
+        return_layers = {
+            "features.2": "0",   # low-level
+            "features.4": "1",
+            "features.6": "2",
+            "features.8": "3",   # high-level
+        }
+
+    # Build a feature extractor that returns these intermediate features
+    try:
+        body = create_feature_extractor(eff, return_nodes=return_layers)
+    except Exception as e:
+        print("Error creating feature extractor. You should inspect model nodes to pick correct return names:")
+        _list_named_modules(eff)
+        raise
+
+    # Optionally freeze backbone params (you can also freeze only earlier layers)
     if freeze_backbone:
-        for name, param in model.backbone.body.named_parameters():
-            param.requires_grad = False
-    # replace predictor
-    in_f = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_f, num_classes)
+        for p in body.parameters():
+            p.requires_grad = False
+
+    # --- 3) detect channels for each returned feature by forwarding a dummy tensor ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    body = body.to(device)
+    with torch.no_grad():
+        dummy = torch.zeros(1, 3, 256, 256).to(device)   # size arbitrary
+        feats = body(dummy)
+    # feats is an OrderedDict, get channels list in the order of return_layers.values()
+    in_channels_list = [v.shape[1] for k, v in feats.items()]  # [C0, C1, C2, C3]
+    print("EfficientNet feature channels:", in_channels_list)
+
+    # --- 4) create FPN ---
+    fpn = FeaturePyramidNetwork(in_channels_list=in_channels_list, out_channels=fpn_out_channels)
+    # Optionally append LastLevelMaxPool to create a P6 level
+    last_level = LastLevelMaxPool()  # if you want an extra level after top
+    # We will wrap body+fpn into a module that returns OrderedDict required by FasterRCNN
+
+    class BackboneWithFPN(nn.Module):
+        def __init__(self, body, fpn, last_level=None):
+            super().__init__()
+            self.body = body
+            self.fpn = fpn
+            self.last_level = last_level
+            self.out_channels = fpn_out_channels
+
+        def forward(self, x):
+            # body returns dict of intermediate feature maps
+            feats = self.body(x)
+            # ensure keys sorted in the expected order (create_feature_extractor preserves insertion order)
+            features = OrderedDict()
+            for k, v in feats.items():
+                features[k] = v
+            # run through FPN; returns OrderedDict of feature maps (names: '0','1','2','3' -> 'fpn0' etc)
+            fpn_outs = self.fpn(features)
+            if self.last_level is not None:
+                # LastLevelMaxPool expects the top-level tensor as input, returns an extra level appended
+                fpn_outs = self.last_level(fpn_outs)
+            return fpn_outs
+
+    backbone = BackboneWithFPN(body, fpn, last_level)
+
+    # --- 5) build FasterRCNN using this backbone ---
+    # Provide kwargs for min_size/max_size if you want to override default resizing behavior
+    kwargs = {"box_detections_per_img": 100}
+    if min_size is not None:
+        kwargs["min_size"] = int(min_size)
+    if max_size is not None:
+        kwargs["max_size"] = int(max_size)
+
+    model = torchvision.models.detection.FasterRCNN(backbone=backbone,
+                                                    num_classes=num_classes,
+                                                    **kwargs)
+
+    # Replace the box_predictor/classifier (already handled by num_classes in constructor, but keep pattern)
+    # in case you want to further customize roi_heads, you can do it here.
     return model
 
 def print_dataset_diagnostics(name, ds, diag_dir, sample_n=8):
@@ -171,7 +298,7 @@ def main():
     val_set   = COCODataset(f"{cfg['root_path']}/valid", cfg["val_ann"],  get_transforms_faster(train=False))
 
     # Setup structured output folders
-    save_dir = PROJECT_ROOT / cfg.get("save_dir", "output")
+    save_dir = PROJECT_ROOT / cfg.get("save_dir", "output_fasterrcnn_efficientnetb0_palm")
     checkpoints_dir = save_dir / "checkpoints"
     plots_dir       = save_dir / "plots"
     logs_dir        = save_dir / "logs"
@@ -198,12 +325,14 @@ def main():
     val_loader   = DataLoader(val_set,   batch_size=cfg["batch_val"], shuffle=False,
                               collate_fn=collate, num_workers=cfg["num_workers"], pin_memory=cfg["pin_memory"])
 
-    # Model/Optim/Sched
-    model = build_model(num_classes=train_set.num_classes,
-                    min_size=cfg.get("min_size"),
-                    max_size=cfg.get("max_size"),
-                    trainable_backbone_layers=0,   # hoặc 1-3
-                    freeze_backbone=False).to(device)
+    model = build_model_efficientnet_b0(
+        num_classes=train_set.num_classes,
+        fpn_out_channels=256,
+        pretrained_backbone=True,
+        trainable_backbone_layers=2,   # tùy chỉnh bao nhiêu layer cuối fine-tune
+        min_size=224, max_size=224,
+        freeze_backbone=False
+    ).to(device)
 
     opt = torch.optim.SGD(model.parameters(),
                           lr=cfg["lr"],
