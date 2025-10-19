@@ -20,7 +20,7 @@ from scripts.train_fasterrcnn_resnet50_palm import build_model  # or from your m
 warnings.filterwarnings("ignore", category=UserWarning)
 
 class FasterROIExtractor:
-    def __init__(self, weights="output/checkpoints/best_model.pth",
+    def __init__(self, weights=r"D:\PMT_Paper_Fasterrcnn-resnet50\output_newdataset\checkpoints\best_loss.pth",
                  num_classes=2, device=None, resize_wh=(800,1333),
                  expand=0.1, class_names=("bg","palm"), vis_save=False):
         """
@@ -199,15 +199,15 @@ class FasterROIExtractor:
 # Example usage:
 if __name__ == "__main__":
     ext = FasterROIExtractor(
-        weights="output/checkpoints/best_loss.pth",
+        weights=r"D:\PMT_Paper_Fasterrcnn-resnet50\output_newdataset\checkpoints\best_loss.pth",
         num_classes=2,
-        resize_wh=(640,480),   # height,width used when creating input tensor
+        resize_wh=(224,224),   # height,width used when creating input tensor
         class_names=("bg","palm"),
         vis_save=False
     )
     rois = ext.process_image(
         r"D:\PMT_\detect_roi\processed_dataset\autoUser1554\img_9.png",
-        out_dir=r"D:\PMT_Paper_Fasterrcnn-resnet50\output\rois",
+        out_dir=r"D:\PMT_Paper_Fasterrcnn-resnet50\output_fasterrcnn_efficientnetb0_palm_newdataset\rois",
         conf=0.3,
         topk=1,
         save_vis=True
